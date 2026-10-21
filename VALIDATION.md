@@ -2,6 +2,68 @@
 
 Investigation date: October 21, 2026. Tests were run locally on macOS/clang.
 
+## New receiver capture: two UTC times recovered
+
+`MONO-026.wav` is a real, user-supplied receiver recording, not generated audio.
+It is 184.997732 s, 44,100 Hz, 16-bit stereo with identical channels.
+SHA-256: `7e8a495a6e02cf03467c18f8e9eb866a731ef46a4ad07b6f5c6b1aeea0ed0cea`.
+
+The unmodified strict decoder rejects all full frames. The supplied WIP patch
+produces both the plausible 2026/day 294/18:12 time and a false
+2042/day 234/15:42 alias, so its relaxed validation alone is not acceptable.
+
+The added opt-in recovery mode produces:
+
+```text
+SYNC  recovered minute boundary at 51.015 s into the recording
+FRAME R01001100P100001000P0001010001001001001P0100000101101001000P  markers=4/6
+UTC   YY=26 DOY=294 18:11:00 (recovered; adjacent minute and timing tone agree)
+FLAGS not validated in recovery mode; inspect the measured FRAME symbols
+SYNC  recovered minute boundary at 111.031 s into the recording
+FRAME R01001100P010001000P000101000P001001001P010000010P101001000P  markers=6/6
+UTC   YY=26 DOY=294 18:12:00 (recovered; adjacent minute and timing tone agree)
+FLAGS not validated in recovery mode; inspect the measured FRAME symbols
+```
+
+Day 294 of 2026 is October 21. These are complete **UTC date/time fields**,
+confirmed by a second independently measured minute and separate long timing
+tones. They are not intact, fully validated 60-symbol frames. In particular,
+marker/reserved-bit errors remain visible, and status flags are not certified.
+No date/time hints, the patch's expected value, file metadata, or computer
+clock are inputs to decoding. The supplied patch was tested separately; it
+was not applied to the main decoder.
+
+Run from the project directory:
+
+```sh
+make
+./wwvdecode -i "$HOME/Downloads/MONO-026.wav" --recover --min-snr 1 --no-analyze
+```
+
+The algorithm is documented in README.md. The decision ratio and lower SNR
+threshold were chosen while investigating this capture; confirmation reduces
+false detections but does not establish a general false-alarm rate. The
+boundary estimates are not precision PPS measurements. This result does not
+validate the earlier recording, arbitrary missing audio, or an ESP32 build.
+
+The suite now has 21 integration test methods plus C unit checks. With both
+local recordings supplied, all 21 run. Public CI skips three tests requiring
+local audio. Recovery tests cover both stations, hour markers, century
+rollover, one-minute rejection, inconsistent-minute rejection, missing long
+tones, noise, and the new capture's exact pair of UTC times. Unit checks also
+reject invalid BCD, time-bit erasures, excess framing damage, and ambiguous
+supported time chains. All original strict-mode regression tests remain.
+
+```sh
+WWV_REAL_CAPTURE="$HOME/wwvdecode/recordings/real-wwv.raw" \
+WWV_NEW_CAPTURE="$HOME/Downloads/MONO-026.wav" make test
+```
+
+Receiver recordings remain local and are not included in the public source
+repository. Logs from the initial baseline, WIP-patch experiment and recovery
+run are preserved in the chat workspace's `outputs/mono026-investigation`.
+
+
 ## What changed
 
 The previous decoder rejected even the generator's clean default signal.

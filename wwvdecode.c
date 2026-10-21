@@ -391,7 +391,7 @@ static int sec_stats(const cenv_t *e, double sec_start, secstat_t *o) {
 
 /* Decide one symbol.  min_snr is the required pulse-to-floor power ratio
    in dB; below it the second is reported as unknown rather than guessed. */
-static symbol_t sec_decide(const secstat_t *st, double min_snr_db, double *snr_db) {
+static symbol_t sec_decide_ratio(const secstat_t *st, double min_snr_db, double *snr_db, double ratio) {
     double floor_ = st->d > 0.0 ? st->d : 1e-30;
     double snr = st->a / floor_;
     if (snr_db) *snr_db = 10.0 * log10(snr > 0.0 ? snr : 1e-30);
@@ -399,9 +399,13 @@ static symbol_t sec_decide(const secstat_t *st, double min_snr_db, double *snr_d
 
     double ref = st->a - st->d;
     if (ref <= 0.0) return SYM_UNKNOWN;
-    if ((st->c - st->d) > 0.45 * ref) return SYM_MARK;
-    if ((st->b - st->d) > 0.45 * ref) return SYM_ONE;
+    if ((st->c - st->d) > ratio * ref) return SYM_MARK;
+    if ((st->b - st->d) > ratio * ref) return SYM_ONE;
     return SYM_ZERO;
+}
+
+static symbol_t sec_decide(const secstat_t *st,double min_snr_db,double *snr_db) {
+    return sec_decide_ratio(st,min_snr_db,snr_db,.45);
 }
 
 /* ------------------------------------------------------------------ */
@@ -454,18 +458,12 @@ static int markers_present(const symbol_t *sym) {
 
 /* Validate each decimal digit, not just the weighted total.  Invalid BCD
    such as a units digit of 12 must never be reported as a UTC time. */
-static int frame_valid(const symbol_t *sym) {
+static int frame_calendar_valid(const symbol_t *sym) {
     const int digit[][4] = {{4,5,6,7}, {51,52,53,54}, {10,11,12,13},
         {15,16,17,-1}, {20,21,22,23}, {25,26,-1,-1},
         {30,31,32,33}, {35,36,37,38}, {40,41,-1,-1}};
     const int maximum[] = {9,9,9,5,9,2,9,9,3};
-    const int reserved[] = {1,8,14,18,24,27,28,34,42,43,44,45,46,47,48};
     int value[9], ok = 1;
-    if (!markers_ok(sym) || sym[0] != SYM_HOLE) return 0;
-    for (int i = 1; i < 60; ++i)
-        if (i % 10 != 9 && sym[i] != SYM_ZERO && sym[i] != SYM_ONE) return 0;
-    for (size_t j = 0; j < sizeof(reserved)/sizeof(*reserved); ++j)
-        if (sym[reserved[j]] != SYM_ZERO) return 0;
     for (int j = 0; j < 9; ++j) {
         value[j] = 0;
         for (int k = 0; k < 4 && digit[j][k] >= 0; ++k)
@@ -476,6 +474,16 @@ static int frame_valid(const symbol_t *sym) {
     int hour = value[4] + 10*value[5];
     int day = value[6] + 10*value[7] + 100*value[8];
     return ok && hour <= 23 && day >= 1 && day <= (yy % 4 == 0 ? 366 : 365);
+}
+
+static int frame_valid(const symbol_t *sym) {
+    const int reserved[]={1,8,14,18,24,27,28,34,42,43,44,45,46,47,48};
+    if(!markers_ok(sym) || sym[0]!=SYM_HOLE) return 0;
+    for(int i=1;i<60;++i)
+        if(i%10!=9 && sym[i]!=SYM_ZERO && sym[i]!=SYM_ONE) return 0;
+    for(size_t j=0;j<sizeof(reserved)/sizeof(*reserved);++j)
+        if(sym[reserved[j]]!=SYM_ZERO) return 0;
+    return frame_calendar_valid(sym);
 }
 
 static int64_t frame_minutes(const symbol_t *s) {
@@ -854,6 +862,154 @@ static int offline_track(const cenv_t *e, double min_snr, int verbose) {
            valid,total,steps ? sum_step/steps : 0.0);
     free(dp); free(back); free(times); free(phases);
     return valid;
+}
+
+/* Experimental offline recovery: relaxed framing alone is never acceptance.
+   Every time bit is measured, two adjacent complete times must agree, and
+   each frame needs a separately measured long timing tone at its boundary. */
+static int time_bearing_second(int sec) {
+    const int bits[] = {4,5,6,7,51,52,53,54,10,11,12,13,15,16,17,
+                       20,21,22,23,25,26,30,31,32,33,35,36,37,38,40,41};
+    for (size_t j=0;j<sizeof(bits)/sizeof(*bits);++j)
+        if (bits[j]==sec) return 1;
+    return 0;
+}
+
+static int recover_time_valid(const symbol_t *sym) {
+    const int reserved[]={1,8,14,18,24,27,28,34,42,43,44,45,46,47,48};
+    if (sym[0]!=SYM_HOLE || markers_present(sym)<4) return 0;
+    int bad=0;
+    for(int k=1;k<60;++k) {
+        if(time_bearing_second(k) && sym[k]!=SYM_ZERO && sym[k]!=SYM_ONE) return 0;
+    }
+    for(size_t j=0;j<sizeof(reserved)/sizeof(*reserved);++j)
+        bad+=sym[reserved[j]]!=SYM_ZERO;
+    return bad<=2 && frame_calendar_valid(sym);
+}
+
+static double recovery_tone_power(const pcm_t *p,double start,double len,double freq) {
+    if(start<0 || start+len>(double)p->n/p->rate) return 0;
+    size_t first=(size_t)llround(start*p->rate), n=(size_t)llround(len*p->rate);
+    if(first>p->n || n>p->n-first) return 0;
+    return band_power(p->s+first,n,p->rate,freq,len);
+}
+
+static int recovery_minute_tone(const pcm_t *p,double t,double offset) {
+    const double tones[]={1000,1200,1500};
+    for(size_t f=0;f<sizeof(tones)/sizeof(*tones);++f) {
+        double hz=tones[f]+offset, sum=0; int clean=0;
+        double after=recovery_tone_power(p,t+.84,.14,hz);
+        for(int j=0;j<4;++j) {
+            double start=t+.06+.18*j;
+            double on=recovery_tone_power(p,start,.14,hz);
+            double noise=.5*(recovery_tone_power(p,start,.14,hz-30)+
+                              recovery_tone_power(p,start,.14,hz+30));
+            if(on>16*fmax(noise,1e-20)) ++clean;
+            sum+=on/4;
+        }
+        /* Broad speech/harmonics and a short tick do not supply four
+           narrowband segments followed by the minute tone's falling edge. */
+        if(clean==4 && sum>9*fmax(after,1e-20)) return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    double t,score;
+    int64_t minute;
+    symbol_t sym[60];
+    int confirmed,ambiguous;
+} recovery_candidate_t;
+
+static int recovery_neighbors(const recovery_candidate_t *a,const recovery_candidate_t *b) {
+    const int64_t century=36525LL*24*60;
+    return fabs(b->t-a->t-60)<.25 &&
+           (b->minute-a->minute+century)%century==1;
+}
+
+static void recovery_confirm(recovery_candidate_t *cand,size_t count) {
+    for(size_t i=0;i<count;++i)
+        for(size_t j=i+1;j<count && cand[j].t-cand[i].t<60.25;++j)
+            if(recovery_neighbors(&cand[i],&cand[j])) cand[i].confirmed=cand[j].confirmed=1;
+    /* If two different times both acquire support at the same boundary,
+       reject the ambiguity instead of selecting the highest score. */
+    for(size_t i=0;i<count;++i) for(size_t j=i+1;j<count && cand[j].t-cand[i].t<5;++j)
+        if(cand[i].confirmed && cand[j].confirmed && cand[i].minute!=cand[j].minute)
+            cand[i].ambiguous=cand[j].ambiguous=1;
+    for(size_t first=0;first<count;) {
+        size_t end=first+1;int ambiguous=0;
+        while(end<count && cand[end].t-cand[first].t<5) ++end;
+        for(size_t j=first;j<end;++j) ambiguous|=cand[j].ambiguous;
+        for(size_t j=first;j<end;++j) {cand[j].ambiguous=ambiguous;cand[j].confirmed=0;}
+        first=end;
+    }
+    /* A surviving frame must still have a surviving neighbor after an
+       ambiguous group has been removed. */
+    for(size_t i=0;i<count;++i)
+        for(size_t j=i+1;j<count && cand[j].t-cand[i].t<60.25;++j)
+            if(!cand[i].ambiguous && !cand[j].ambiguous && recovery_neighbors(&cand[i],&cand[j]))
+                cand[i].confirmed=cand[j].confirmed=1;
+}
+
+static void print_recovered_frame(const recovery_candidate_t *c) {
+    /* The time-bearing bits already passed exact digit/calendar checks. */
+    int ok=1;
+    const int y1[]={4,5,6,7},yt[]={51,52,53,54},w[]={1,2,4,8},wt[]={10,20,40,80};
+    const int ms[]={10,11,12,13,15,16,17},mw[]={1,2,4,8,10,20,40};
+    const int hs[]={20,21,22,23,25,26},hw[]={1,2,4,8,10,20};
+    const int ds[]={30,31,32,33,35,36,37,38,40,41},dw[]={1,2,4,8,10,20,40,80,100,200};
+    const symbol_t *s=c->sym;
+    int yy=decode_weighted(s,y1,w,4,&ok)+decode_weighted(s,yt,wt,4,&ok);
+    int day=decode_weighted(s,ds,dw,10,&ok),hh=decode_weighted(s,hs,hw,6,&ok);
+    int mm=decode_weighted(s,ms,mw,7,&ok);
+    printf("SYNC  recovered minute boundary at %.3f s into the recording\nFRAME ",c->t);
+    for(int k=0;k<60;++k) putchar(symchar(s[k]));
+    printf("  markers=%d/6\n",markers_present(s));
+    printf("UTC   YY=%02d DOY=%03d %02d:%02d:00 (recovered; adjacent minute and timing tone agree)\n",yy,day,hh,mm);
+    printf("FLAGS not validated in recovery mode; inspect the measured FRAME symbols\n");
+}
+
+static int offline_recover(const cenv_t *e,const pcm_t *p,double offset,double min_snr) {
+    if(e->n<(size_t)(60*e->sps)) return 0;
+    size_t last=e->n-(size_t)(60*e->sps), capacity=0,count=0;
+    recovery_candidate_t *cand=NULL;
+    printf("RECOVER experimental: decision ratio 0.30, pulse/floor threshold %.1f dB;\n"
+           "        requires two adjacent times and separate long timing tones\n",min_snr);
+    for(size_t i=0;i<=last && !stop_flag;i+=2) {
+        symbol_t sym[60];
+        for(int k=0;k<60;++k) {
+            secstat_t st;
+            if(!sec_stats(e,i+k*e->sps,&st)) sym[k]=SYM_UNKNOWN;
+            else sym[k]=sec_decide_ratio(&st,min_snr,NULL,.30);
+        }
+        if(frame_hole(e,(double)i)) sym[0]=SYM_HOLE;
+        if(!recover_time_valid(sym)) continue;
+        double t=i/e->sps;
+        if(!recovery_minute_tone(p,t,offset)) continue;
+        if(count==capacity) {
+            size_t next=capacity?capacity*2:32;
+            if(next>SIZE_MAX/sizeof(*cand)) {free(cand);return 0;}
+            recovery_candidate_t *v=realloc(cand,next*sizeof(*cand));
+            if(!v) {free(cand);return 0;} cand=v;capacity=next;
+        }
+        recovery_candidate_t *c=&cand[count++]; memset(c,0,sizeof(*c));
+        c->t=t;c->score=frame_score(e,(double)i);c->minute=frame_minutes(sym);
+        memcpy(c->sym,sym,sizeof(c->sym));
+    }
+    recovery_confirm(cand,count);
+    int decoded=0;
+    for(size_t first=0;first<count;) {
+        size_t end=first+1,best=count;int ambiguous=0;
+        while(end<count && cand[end].t-cand[first].t<5) ++end;
+        for(size_t j=first;j<end;++j) {
+            ambiguous|=cand[j].ambiguous;
+            if(cand[j].confirmed && (best==count || cand[j].score>cand[best].score)) best=j;
+        }
+        if(best<count && !ambiguous) {print_recovered_frame(&cand[best]);++decoded;}
+        first=end;
+    }
+    printf("RECOVER %d complete UTC frames confirmed; %zu timing-anchored candidates examined\n",decoded,count);
+    free(cand);return decoded;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1371,8 +1527,8 @@ static void analyze(const pcm_t *p, double off, const cenv_t *e) {
         double em = 10.0 * log10(s_on * 0.77 / (tb * fmax(pn, 1e-30)));
         printf("  estimated E/N0    %+.1f dB for a 170 ms '0', %+.1f dB for a"
                " 470 ms '1', %+.1f dB for a 770 ms marker\n", e0, e1, em);
-        printf("  hard bit decisions want about +12 dB, so this recording is"
-               " %.0f dB short\n", 12.0 - e0);
+        printf("  approximate 12 dB reference: %+.0f dB margin; this mean energy\n"
+               "  estimate does not measure fading or individual-bit reliability\n",e0-12.0);
         if (e0 < 8.0)
             printf("  VERDICT: too weak for reliable per-minute decoding\n");
         else
@@ -1498,7 +1654,7 @@ static void analyze(const pcm_t *p, double off, const cenv_t *e) {
 static int run_file(const char *path, unsigned rate, double tone_offset,
                     int manual_offset, int do_analyze, int do_search,
                     int ncand, double at_time, double harm_reject,
-                    double min_snr, int verbose, int stream_too, int track_too) {
+                    double min_snr, int verbose, int stream_too, int track_too, int recover) {
     pcm_t p;
     memset(&p, 0, sizeof(p));
     if (pcm_load(path, rate, &p) < 0) return 1;
@@ -1520,6 +1676,7 @@ static int run_file(const char *path, unsigned rate, double tone_offset,
 
     int decoded = 0;
     if (at_time >= 0.0) decoded += decode_at(&e, at_time, min_snr, verbose, NULL);
+    if (recover) decoded += offline_recover(&e,&p,tone_offset,min_snr);
     if (do_search) decoded += offline_search(&e, ncand, min_snr, verbose);
     if (track_too || (do_search && !decoded)) decoded += offline_track(&e,min_snr,verbose);
 
@@ -1539,7 +1696,7 @@ static int run_file(const char *path, unsigned rate, double tone_offset,
 
     cenv_free(&e);
     pcm_free(&p);
-    if ((at_time >= 0.0 || do_search || stream_too || track_too) && !decoded) {
+    if ((at_time >= 0.0 || do_search || stream_too || track_too || recover) && !decoded) {
         fprintf(stderr,"decode: no complete validated UTC frame (exit status 3)\n");
         return 3;
     }
@@ -1674,6 +1831,7 @@ static void usage(FILE *f, const char *argv0) {
         "      --search       exhaustive minute-phase search\n"
         "      --candidates N report the best N hypotheses (default 5)\n"
         "      --at SECONDS   decode the frame starting at this file time\n"
+        "      --recover      experimental two-minute recovery; try --min-snr 1\n"
         "      --track        follow variable second timing (also a search fallback)\n"
         "      --stream       also run the live streaming decoder over the file\n"
         "      --no-analyze, --no-search\n"
@@ -1695,7 +1853,7 @@ static void usage(FILE *f, const char *argv0) {
 
 enum {
     OPT_RAW = 1000, OPT_ANALYZE, OPT_NOANALYZE, OPT_SEARCH, OPT_NOSEARCH,
-    OPT_AT, OPT_CAND, OPT_HARM, OPT_SNR, OPT_STREAM, OPT_TRACK
+    OPT_AT, OPT_CAND, OPT_HARM, OPT_SNR, OPT_STREAM, OPT_TRACK, OPT_RECOVER
 };
 
 int main(int argc, char **argv) {
@@ -1704,7 +1862,7 @@ int main(int argc, char **argv) {
     unsigned rate = DEFAULT_RATE;
     int raw = 0, verbose = 0, auto_offset = 0, manual_offset = 0;
     double tone_offset = 0.0;
-    int do_analyze = -1, do_search = -1, stream_too = 0, track_too = 0;
+    int do_analyze = -1, do_search = -1, stream_too = 0, track_too = 0, recover = 0;
     int ncand = 5;
     double at_time = -1.0;
     double harm_reject = 0.50;
@@ -1727,6 +1885,7 @@ int main(int argc, char **argv) {
         {"min-snr", required_argument, 0, OPT_SNR},
         {"stream", no_argument, 0, OPT_STREAM},
         {"track", no_argument, 0, OPT_TRACK},
+        {"recover", no_argument, 0, OPT_RECOVER},
         {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
@@ -1768,6 +1927,7 @@ int main(int argc, char **argv) {
             case OPT_NOSEARCH: do_search = 0; break;
             case OPT_STREAM: stream_too = 1; break;
             case OPT_TRACK: track_too = 1; break;
+            case OPT_RECOVER: recover = 1; break;
             case OPT_AT: at_time = strtod(optarg, NULL); break;
             case OPT_CAND: ncand = atoi(optarg); if (ncand < 1) ncand = 1; break;
             case OPT_HARM: harm_reject = strtod(optarg, NULL); break;
@@ -1783,12 +1943,16 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
+    if (recover && (!infile || at_time>=0 || stream_too || track_too || do_search==1)) {
+        fprintf(stderr,"--recover requires a file and cannot combine with --at, --search, --track or --stream\n");
+        return 2;
+    }
     if (infile) {
         if (do_analyze < 0) do_analyze = 1;
-        if (do_search < 0) do_search = (at_time < 0.0 && !track_too);
+        if (do_search < 0) do_search = (at_time < 0.0 && !track_too && !recover);
         return run_file(infile, rate, tone_offset, manual_offset, do_analyze,
                         do_search, ncand, at_time, harm_reject, min_snr,
-                        verbose, stream_too, track_too);
+                        verbose, stream_too, track_too, recover);
     }
 
     if (auto_offset && manual_offset) {

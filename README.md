@@ -3,8 +3,10 @@
 Experimental C decoder for the WWV / WWVH 100 Hz BCD time code in receiver
 audio, with a Python signal generator and regression tests.
 
-**Full UTC decoding is verified on synthetic signals. The supplied receiver
-capture, `real-wwv.raw`, has NOT produced a trustworthy full UTC decode.**
+**Synthetic tests pass, and experimental recovery decodes two consecutive UTC
+times from the real `MONO-026.wav` recording: 2026-10-21 18:11 and 18:12 UTC.
+Status flags are not validated in recovery mode. The older `real-wwv.raw`
+capture still has no trustworthy full UTC decode.**
 See [VALIDATION.md](VALIDATION.md) for the measured results and remaining work.
 
 ## Build and test
@@ -72,6 +74,35 @@ Useful options:
 - `--candidates N`: fixed-search output limit, default 5.
 - `--no-analyze`: suppress the signal report.
 - `-v`: per-second measurements.
+
+## Experimental recovery from damaged frames
+
+```sh
+./wwvdecode -i "$HOME/Downloads/MONO-026.wav" --recover --min-snr 1
+```
+
+Recovery is a separate, opt-in file mode. It uses a 0.30 symbol decision ratio
+instead of the usual 0.45, permits two damaged position markers and two
+nonzero/unknown reserved bits, and does not validate status flags. All 31
+time-bearing bits must still be measured as binary values, with exact BCD
+and calendar checks. **No expected year, day, hour or minute is supplied to
+the decoder.**
+
+Relaxed frame checks alone can accept a false timestamp. Recovery therefore
+also requires two measured UTC times advancing by exactly one minute, with
+recorded boundaries 60 seconds apart (within 0.25 s). Each boundary must have
+a separate long 1000/1200/1500 Hz timing tone: four narrowband segments at
+least 12 dB above neighboring frequency probes, followed by an amplitude
+drop. Conflicting supported times at the same boundary are rejected. It
+prints the original measured symbols, including damaged markers and reserved
+bits; it does not repair them or substitute expected bits.
+
+Only confirmed UTC times are emitted. DUT1, leap-warning and DST flags remain
+explicitly unvalidated. The thresholds were developed using this recording
+and synthetic rejection cases; broader off-air validation is still needed.
+This mode uses fixed second spacing and does not handle arbitrary capture
+gaps. It cannot combine with `--search`, `--at`, `--track` or `--stream`.
+Without two compatible complete frames and long timing tones it exits 3.
 
 ## Generate an independent test signal
 

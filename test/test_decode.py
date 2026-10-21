@@ -96,6 +96,43 @@ class DecodeTests(unittest.TestCase):
         p=Path(os.environ['WWV_REAL_CAPTURE'])
         out=self.decode(p,'--track',expected=3)
         self.assertFalse(self.times(out))
+    def test_recovery_requires_neighbors(self):
+        p=self.generate('one.raw','--minutes','1','--snr','30')
+        self.assertFalse(self.times(self.decode(p,'--recover','--min-snr','1',expected=3)))
+    def test_recovery_times_and_stations(self):
+        for station in ('wwv','wwvh'):
+            with self.subTest(station=station):
+                p=self.generate('recover.raw','--station',station,'--snr','30',
+                                '--yy','99','--doy','365','--hh','23','--mm','59')
+                out=self.decode(p,'--recover','--min-snr','1')
+                self.assertEqual(self.times(out),{(99,365,23,59),(0,1,0,0),(0,1,0,1)})
+    def test_recovery_rejects_inconsistent_minutes(self):
+        a=self.generate('a.raw','--minutes','1','--snr','30','--mm','13')
+        b=self.generate('b.raw','--minutes','1','--snr','30','--mm','17')
+        p=self.folder/'joined.raw';p.write_bytes(a.read_bytes()+b.read_bytes())
+        self.assertFalse(self.times(self.decode(p,'--recover','--min-snr','1',expected=3)))
+    def test_recovery_requires_long_timing_tones(self):
+        p=self.generate('no-tones.raw','--snr','30')
+        samples=np.fromfile(p,dtype='<i2')
+        for first in range(0,len(samples),8000*60):samples[first:first+8000]=0
+        samples.tofile(p)
+        self.assertFalse(self.times(self.decode(p,'--recover','--min-snr','1',expected=3)))
+    def test_recovery_rejects_noise(self):
+        for seed in range(3):
+            p=self.folder/'noise.raw'
+            np.random.default_rng(seed).normal(0,3000,8000*180).astype('<i2').tofile(p)
+            self.assertFalse(self.times(self.decode(p,'--recover','--min-snr','1','-o','0',expected=3)))
+    @unittest.skipUnless(os.environ.get('WWV_NEW_CAPTURE'),'new receiver recording not supplied')
+    def test_new_capture_two_consecutive_times(self):
+        p=Path(os.environ['WWV_NEW_CAPTURE'])
+        out=self.decode(p,'--recover','--min-snr','1')
+        self.assertEqual(self.times(out),{(26,294,18,11),(26,294,18,12)})
+        self.assertIn('FLAGS not validated',out)
+    @unittest.skipUnless(os.environ.get('WWV_REAL_CAPTURE'),'old receiver recording not supplied')
+    def test_recovery_does_not_claim_old_capture(self):
+        p=Path(os.environ['WWV_REAL_CAPTURE'])
+        out=self.decode(p,'--recover','--min-snr','1',expected=3)
+        self.assertFalse(self.times(out))
     def test_analyze_only(self):
         p=self.folder/'short.raw';np.zeros(8000*2,dtype='<i2').tofile(p)
         self.decode(p,'-o','0','--no-search')
