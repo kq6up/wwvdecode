@@ -1,0 +1,11 @@
+/wwvdecode
+/test/test_core
+/.venv/
+__pycache__/
+*.pyc
+*.raw
+*.wav
+*.aiff
+*.bin
+.DS_Store
+/recordings/
