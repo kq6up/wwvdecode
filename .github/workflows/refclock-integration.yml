@@ -1,0 +1,13 @@
+name: refclock-integration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  chrony:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f test/Dockerfile -t wwvdecode-test .
+      - run: docker run --rm --cap-drop=SYS_TIME --network=none wwvdecode-test

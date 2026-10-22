@@ -156,3 +156,12 @@ Code pulses start 30 ms after each second boundary and last 170, 470, or
 770 ms. Second 0 has no code pulse; seconds 9,19,29,39,49,59 are markers.
 Information refers to the UTC at the **start** of that minute. The year is only
 two digits; this program uses the 2000–2099 leap-year interpretation.
+
+## Live clock-service outputs and daemon configuration
+
+Optional NTP SHM and chrony SOCK producers are built into the C decoder.
+It also supports explicit key=value configuration, foreground supervision and
+traditional background mode with PID locking and log redirection. Outputs
+require timestamped live input and agreement between two strict UTC minutes.
+They never set the host clock themselves. See [REFCLOCK.md](REFCLOCK.md) for
+configuration, limitations and the isolated synthetic Linux integration test.

@@ -9,3 +9,6 @@ __pycache__/
 *.bin
 .DS_Store
 /recordings/
+
+/test/test_refclock
+*.log

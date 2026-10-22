@@ -16,17 +16,20 @@ else
 endif
 
 all: wwvdecode
-wwvdecode: wwvdecode.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
-noalsa: wwvdecode.c
-	$(CC) -O2 -Wall -Wextra -DWWV_NO_ALSA -o wwvdecode $< -lm
+wwvdecode: wwvdecode.c refclock.c refclock.h service.c service.h
+	$(CC) $(CFLAGS) -o $@ $< refclock.c service.c $(LDLIBS)
+noalsa: wwvdecode.c refclock.c refclock.h service.c service.h
+	$(CC) -O2 -Wall -Wextra -DWWV_NO_ALSA -o wwvdecode $< refclock.c service.c -lm
 
-test/test_core: test/test_core.c wwvdecode.c
-	$(CC) -O2 -Wall -Wextra -Werror -DWWV_NO_ALSA -o $@ $< -lm
-test: wwvdecode test/test_core
+test/test_core: test/test_core.c wwvdecode.c refclock.c refclock.h service.c service.h
+	$(CC) -O2 -Wall -Wextra -Werror -DWWV_NO_ALSA -o $@ $< refclock.c service.c -lm
+test/test_refclock: test/test_refclock.c refclock.c refclock.h service.c service.h
+	$(CC) -O2 -Wall -Wextra -Werror -o $@ $< refclock.c service.c -lm
+test: wwvdecode test/test_core test/test_refclock
 	./test/test_core
+	./test/test_refclock
 	$(PYTHON) -m unittest discover -s test -v
 
 clean:
-	rm -f wwvdecode test/test_core
+	rm -f wwvdecode test/test_core test/test_refclock
 .PHONY: all noalsa test clean

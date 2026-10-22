@@ -154,3 +154,55 @@ explicit erasures, plus a new capture with known start/duration to distinguish
 receiver filtering from sample loss. That would permit a fair real-audio
 accuracy test. The current tracker handles gradual short gaps, not arbitrary
 whole-second deletions or every mixed-station/interference case.
+
+## October 22, 2026: clock outputs and service operation
+
+Added NTP SHM and chrony SOCK producers, explicit configuration-file loading,
+foreground supervision and optional double-fork background operation. The
+outputs require two consecutive strict minutes with measured minute tones and
+fresh capture timestamps. File/recovery results cannot be exported as current
+time. See REFCLOCK.md for the capture-time mapping and operational limits.
+
+The streaming harmonic gate now compares the fast timing correlator against
+the program-tone source. Its former slow monitor suppressed genuine 5 ms
+ticks. A synthetic minute now yielded all 57 scheduled second ticks rather
+than only the 14 ticks near the end of the minute.
+
+Validation uses a disposable QEMU Alpine 3.22.7 aarch64 VM with GCC 14.2, ALSA
+headers, Python/NumPy and chrony 4.6.1. No existing Slackware VM was changed.
+The Linux suite runs 28 Python methods (three local-recording tests skipped),
+plus C core, config, SOCK ABI and SHM checks. Background startup/shutdown on
+ALSA's null device, failed-start notification, PID locking, configuration
+precedence, invalid timestamps and forbidden offline exports are covered.
+macOS/clang runs the same portable tests; its ALSA daemon test is skipped.
+Address/undefined-behavior sanitizer checks of the refclock and service tests
+also passed. No physical ALSA capture hardware was exercised.
+
+The existing real-audio regressions were also run locally: MONO-026 still
+requires opt-in recovery, the earlier real-wwv.raw is still rejected as a full
+decode, and MONO-027 yields the same three strict UTC frames, 2026/day 294 at
+22:45, 22:46 and 22:47. Receiver recordings remain unpublished. These file
+checks do not validate live capture timestamps or radio-path accuracy.
+
+The real-time integration harness feeds synthetic audio through the live
+decoder and both drivers to an actual chronyd in the guest. It deliberately
+uses reference-minus-host offsets of +0.250 s and -0.375 s; this exercises both
+signs and detects minute-association errors. chronyd runs with `-x`, with
+CAP_SYS_TIME removed from both effective and bounding capability sets. No
+chronyd/ntpd runs on the Mac, and no Mac clock configuration was changed.
+The supplied Docker recipe and manual GitHub workflow reproduce this test;
+the Docker recipe has not been executed locally.
+
+The automated two-sign integration test passed. chronyd selected the SOCK
+source (`#* WVSK`); SHM was deliberately configured `noselect`. Raw measurements
+were accepted from both sources:
+
+| Injected reference offset | SOCK samples | SHM samples | Raw offset median |
+| --- | ---: | ---: | ---: |
+| +0.250 s | 54 | 53 | +0.24775 s |
+| -0.375 s | 79 | 79 | -0.37737 s |
+
+These are synthetic integration results, not measured off-air accuracy. The
+uncalibrated timing detector contributes a few milliseconds of bias. Detailed
+consumer and decoder logs are preserved in the chat workspace under
+`outputs/linux-refclock-test/evidence`.

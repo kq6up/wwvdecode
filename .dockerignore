@@ -1,0 +1,10 @@
+.git
+.venv
+recordings
+wwvdecode
+test/test_core
+test/test_refclock
+__pycache__
+*.raw
+*.wav
+*.log

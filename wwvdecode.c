@@ -31,8 +31,8 @@
  *      decoded, this says why.
  *
  * Build:
- *   with ALSA:    cc -O2 -o wwvdecode wwvdecode.c -lasound -lm
- *   without:      cc -O2 -DWWV_NO_ALSA -o wwvdecode wwvdecode.c -lm
+ *   make          (ALSA detected automatically on Linux)
+ *   make noalsa   (portable recording and timestamped-input build)
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -46,8 +46,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "refclock.h"
+#include "service.h"
 
 #ifndef WWV_NO_ALSA
+#include <alloca.h>
 #include <alsa/asoundlib.h>
 #endif
 
@@ -172,6 +175,7 @@ static int pcm_load(const char *path, unsigned rate_hint, pcm_t *out) {
         }
         size_t got = fread(buf + len, 1, cap - len, f);
         len += got;
+        if(ferror(f)){perror(path);free(buf);if(f!=stdin)fclose(f);return -1;}
         if (got == 0) break;
     }
     if (f != stdin) fclose(f);
@@ -1057,7 +1061,8 @@ typedef struct {
     uint64_t tone1000_last_present, tone1500_last_present;
     int minute_marker_armed_1000, minute_marker_armed_1500;
 
-    int synced;
+    int synced, frame_marker;
+    refclock *output;
     double frame_start;
     symbol_t symbols[MAX_SECONDS];
     int ticks_seen[MAX_SECONDS];
@@ -1179,7 +1184,10 @@ static void finish_frame_if_ready(decoder_t *d) {
     if (d->accum_sec >= 1 && d->accum_sec <= 59) finalize_symbol(d, d->accum_sec);
     if (d->accum_sec >= 58) {
         print_frame(d->symbols, d->ticks_seen, d->tick_error_ms);
+        int valid=frame_valid(d->symbols) && d->frame_marker;
         d->decoded_frames += (unsigned)frame_valid(d->symbols);
+        if(d->output) refclock_frame(d->output,946684800LL+60*frame_minutes(d->symbols),
+                                    d->frame_start,valid,d->symbols[3]!=SYM_ZERO);
     }
     else if (d->verbose)
         fprintf(stderr, "dropping incomplete frame (last second %d)\n", d->accum_sec);
@@ -1190,6 +1198,7 @@ static void finish_frame_if_ready(decoder_t *d) {
 static void reset_frame(decoder_t *d, double frame_start) {
     if (d->synced) finish_frame_if_ready(d);
     d->synced = 1;
+    d->frame_marker = 0;
     d->frame_start = frame_start;
     d->accum_sec = -1;
     for (int i = 0; i < MAX_SECONDS; ++i) {
@@ -1249,6 +1258,7 @@ static void register_tick(decoder_t *d, double tick_start) {
     double err_ms = 1000.0 * err / (double)d->rate;
     if (fabs(err_ms) > 20.0) return;
     if (sec == 29 || sec == 59) return;
+    if(d->output) refclock_tick(d->output,tick_start);
     d->ticks_seen[sec] = 1;
     d->tick_error_ms[sec] = err_ms;
     if (sec > 0 && fabs(err_ms) < 12.0) d->frame_start += d->phase_gain * err;
@@ -1276,11 +1286,13 @@ static void update_timing(decoder_t *d, double env1000, double env1500, double r
        timing frequencies, so require the timing tone to dominate its
        possible parent before believing it. */
     double parent = fmax(m500, m600);
-    if (p1000 && parent > 1e-4 && m1000 < d->harm_reject * parent) {
+    /* Compare the fast timing correlator with the harmonic source. The
+       narrow 3 Hz monitor cannot rise during a 5 ms tick. */
+    if (p1000 && parent > 1e-4 && env1000 < d->harm_reject * parent) {
         p1000 = 0;
         d->harm_blocked++;
     }
-    if (p1500 && m500 > 1e-4 && m1500 < d->harm_reject * m500) p1500 = 0;
+    if (p1500 && m500 > 1e-4 && env1500 < d->harm_reject * m500) p1500 = 0;
 
     if (p1000) {
         if (!d->tone1000_present) {
@@ -1302,6 +1314,7 @@ static void update_timing(decoder_t *d, double env1000, double env1500, double r
             if (d->tone1500_last_present == 0 || now - d->tone1500_last_present > gap_tol) {
                 d->tone1500_start = now;
                 d->minute_marker_armed_1500 = 1;
+                register_tick(d,(double)now);
             }
             d->tone1500_present = 1;
         }
@@ -1316,6 +1329,7 @@ static void update_timing(decoder_t *d, double env1000, double env1500, double r
         int spectral_ok = (m1000 > 1.30 * neighbor) && (m1000 > 2e-4);
         if (spectral_ok) {
             if (!d->synced) reset_frame(d, (double)d->tone1000_start);
+            if(fabs((double)d->tone1000_start-d->frame_start)<.04*d->rate) d->frame_marker=1;
             d->minute_marker_armed_1000 = 0;
         } else if (now - d->tone1000_start > (uint64_t)(0.950 * d->rate)) {
             d->minute_marker_armed_1000 = 0;
@@ -1326,6 +1340,7 @@ static void update_timing(decoder_t *d, double env1000, double env1500, double r
         int spectral_ok = (m1500 > 1.30 * neighbor) && (m1500 > 2e-4);
         if (spectral_ok) {
             if (!d->synced) reset_frame(d, (double)d->tone1500_start);
+            if(fabs((double)d->tone1500_start-d->frame_start)<.04*d->rate) d->frame_marker=1;
             d->minute_marker_armed_1500 = 0;
         } else if (now - d->tone1500_start > (uint64_t)(0.950 * d->rate)) {
             d->minute_marker_armed_1500 = 0;
@@ -1418,6 +1433,7 @@ static double estimate_tone_offset(const int16_t *buf, size_t n, unsigned rate,
     /* Coherent integration over more than a few seconds is pointless on HF
        (ionospheric Doppler smears the line), so score several short blocks
        and add the scores. */
+    if(!n || !rate)return 0.0;
     size_t blk = (size_t)rate * 4u;
     if (blk > n) blk = n;
     size_t nblk = n / blk;
@@ -1723,8 +1739,10 @@ static int run_raw(decoder_t *d, int auto_offset, double harm_reject, double min
         double off = estimate_tone_offset(acq, got, d->rate, d->verbose);
         unsigned rate = d->rate;
         int verbose = d->verbose;
+        refclock *output=d->output;
         timing_corr_free(&d->timing);
         decoder_init(d, rate, verbose, off, harm_reject, min_snr);
+        d->output=output;
         decoder_process(d, acq, got);
         free(acq);
     }
@@ -1738,6 +1756,33 @@ static int run_raw(decoder_t *d, int auto_offset, double harm_reject, double min
     }
     decoder_flush(d);
     return 0;
+}
+
+/* First-sample CLOCK_REALTIME and CLOCK_MONOTONIC timestamps followed by PCM.
+   A capture helper must timestamp the source, not arrival at the pipe. */
+static void capture_reset(decoder_t *d) {
+    d->synced=0;d->accum_sec=-1;
+    if(d->output) refclock_reset(d->output,"capture restarted");
+}
+static int run_timed_raw(decoder_t *d) {
+    char line[256];int16_t buf[BLOCK_FRAMES];
+    service_ready(0);
+    while(!stop_flag && fgets(line,sizeof(line),stdin)) {
+        double real,mono;unsigned n;char extra;
+        if(sscanf(line,"WWV1 %lf %lf %u %c",&real,&mono,&n,&extra)!=3 || !n || n>BLOCK_FRAMES) {
+            fprintf(stderr,"invalid timestamped PCM header\n");return 2;
+        }
+        unsigned char bytes[2*BLOCK_FRAMES];
+        if(fread(bytes,2,n,stdin)!=n) {fprintf(stderr,"truncated timestamped PCM block\n");return 2;}
+        for(unsigned i=0;i<n;++i)buf[i]=(int16_t)rd16(bytes+2*i);
+        if(d->output) {
+            int result=refclock_capture(d->output,d->sample_index,n,real,mono);
+            if(result<0) {fprintf(stderr,"rejected capture timestamps\n");return 2;}
+            if(result>0) capture_reset(d);
+        }
+        decoder_process(d,buf,n);
+    }
+    return ferror(stdin)&&!stop_flag ? 1:0;
 }
 
 #ifndef WWV_NO_ALSA
@@ -1769,7 +1814,8 @@ static int run_alsa(decoder_t *d, const char *device, int auto_offset,
             snd_pcm_sframes_t n = snd_pcm_readi(pcm, acq + got, want - got);
             if (n == -EAGAIN) continue;
             if (n < 0) {
-                int r = snd_pcm_recover(pcm, (int)n, 1);
+                capture_reset(d);
+            int r = snd_pcm_recover(pcm, (int)n, 1);
                 if (r < 0) {
                     fprintf(stderr, "ALSA error: %s\n", snd_strerror(r));
                     free(acq); snd_pcm_close(pcm); return 1;
@@ -1781,17 +1827,30 @@ static int run_alsa(decoder_t *d, const char *device, int auto_offset,
         double off = estimate_tone_offset(acq, got, d->rate, d->verbose);
         unsigned rate = d->rate;
         int verbose = d->verbose;
+        refclock *output=d->output;
         timing_corr_free(&d->timing);
         decoder_init(d, rate, verbose, off, harm_reject, min_snr);
+        d->output=output;
         decoder_process(d, acq, got);
         free(acq);
     }
 
+    snd_pcm_sw_params_t *sw;
+    snd_pcm_sw_params_alloca(&sw);
+    if(d->output && (snd_pcm_sw_params_current(pcm,sw)<0 ||
+       snd_pcm_sw_params_set_tstamp_mode(pcm,sw,SND_PCM_TSTAMP_ENABLE)<0 ||
+       snd_pcm_sw_params_set_tstamp_type(pcm,sw,SND_PCM_TSTAMP_TYPE_MONOTONIC)<0 ||
+       snd_pcm_sw_params(pcm,sw)<0)) {
+        fprintf(stderr,"ALSA: cannot enable monotonic capture timestamps\n");snd_pcm_close(pcm);return 1;
+    }
+    snd_pcm_status_t *status;snd_pcm_status_alloca(&status);
+    service_ready(0);
     int16_t buf[BLOCK_FRAMES];
     while (!stop_flag) {
         snd_pcm_sframes_t n = snd_pcm_readi(pcm, buf, BLOCK_FRAMES);
         if (n == -EAGAIN) continue;
         if (n < 0) {
+            capture_reset(d);
             int r = snd_pcm_recover(pcm, (int)n, 1);
             if (r < 0) {
                 fprintf(stderr, "ALSA capture error: %s\n", snd_strerror(r));
@@ -1799,6 +1858,20 @@ static int run_alsa(decoder_t *d, const char *device, int auto_offset,
                 return 1;
             }
             continue;
+        }
+        if(d->output) {
+            if(snd_pcm_status(pcm,status)<0 || snd_pcm_status_get_state(status)!=SND_PCM_STATE_RUNNING) {
+                capture_reset(d);continue;
+            }
+            snd_htimestamp_t stamp;snd_pcm_status_get_htstamp(status,&stamp);
+            snd_pcm_sframes_t delay=snd_pcm_status_get_delay(status);
+            double mono=(double)stamp.tv_sec+stamp.tv_nsec*1e-9-((double)n+delay)/d->rate;
+            double m1=wwv_now(1),real=wwv_now(0),m2=wwv_now(1);
+            if(delay<0 || m2-m1>.005) {capture_reset(d);continue;}
+            real+=mono-(m1+m2)/2;
+            int result=refclock_capture(d->output,d->sample_index,(size_t)n,real,mono);
+            if(result<0) {capture_reset(d);continue;}
+            if(result>0) capture_reset(d);
         }
         decoder_process(d, buf, (size_t)n);
     }
@@ -1818,6 +1891,19 @@ static void usage(FILE *f, const char *argv0) {
         "      --raw          read S16_LE mono from stdin\n"
         "  -D, --device DEV   ALSA capture device (default: %s)\n"
         "  -r, --rate HZ      sample rate for raw input (default: %u)\n"
+        "\n"
+        "Service and refclocks (outputs disabled by default):\n"
+        "  -c, --config FILE  read key=value settings; CLI overrides them\n"
+        "      --check-config validate without opening audio or outputs\n"
+        "      --daemon       double-fork; requires --pidfile and --logfile\n"
+        "      --foreground   stay attached (default; for systemd)\n"
+        "      --pidfile FILE  absolute path, exclusive process lock\n"
+        "      --logfile FILE  absolute path for stdout/stderr\n"
+        "      --shm-unit N    NTP SHM unit 0..255 (-1 disables)\n"
+        "      --sock PATH     chrony Unix datagram socket\n"
+        "      --correction S  seconds added to reference time, default 0\n"
+        "      --precision N   SHM log2 precision, default -5 (~31 ms)\n"
+        "      --timed-raw     timestamped live PCM protocol on stdin\n"
         "\n"
         "Tuning:\n"
         "  -o, --offset HZ    manual audio tone offset\n"
@@ -1853,22 +1939,25 @@ static void usage(FILE *f, const char *argv0) {
 
 enum {
     OPT_RAW = 1000, OPT_ANALYZE, OPT_NOANALYZE, OPT_SEARCH, OPT_NOSEARCH,
-    OPT_AT, OPT_CAND, OPT_HARM, OPT_SNR, OPT_STREAM, OPT_TRACK, OPT_RECOVER
+    OPT_AT, OPT_CAND, OPT_HARM, OPT_SNR, OPT_STREAM, OPT_TRACK, OPT_RECOVER,
+    OPT_CHECK_CONFIG, OPT_DAEMON, OPT_FOREGROUND, OPT_PIDFILE, OPT_LOGFILE,
+    OPT_SHM, OPT_SOCK, OPT_CORRECTION, OPT_PRECISION, OPT_TIMED_RAW
 };
 
 int main(int argc, char **argv) {
-    const char *device = DEFAULT_DEVICE;
-    const char *infile = NULL;
-    unsigned rate = DEFAULT_RATE;
-    int raw = 0, verbose = 0, auto_offset = 0, manual_offset = 0;
-    double tone_offset = 0.0;
-    int do_analyze = -1, do_search = -1, stream_too = 0, track_too = 0, recover = 0;
-    int ncand = 5;
-    double at_time = -1.0;
-    double harm_reject = 0.50;
-    double min_snr = 3.0;
-
+    service_options service;service_defaults(&service);
     static const struct option opts[] = {
+        {"config",required_argument,0,'c'},
+        {"check-config",no_argument,0,OPT_CHECK_CONFIG},
+        {"daemon",no_argument,0,OPT_DAEMON},
+        {"foreground",no_argument,0,OPT_FOREGROUND},
+        {"pidfile",required_argument,0,OPT_PIDFILE},
+        {"logfile",required_argument,0,OPT_LOGFILE},
+        {"shm-unit",required_argument,0,OPT_SHM},
+        {"sock",required_argument,0,OPT_SOCK},
+        {"correction",required_argument,0,OPT_CORRECTION},
+        {"precision",required_argument,0,OPT_PRECISION},
+        {"timed-raw",no_argument,0,OPT_TIMED_RAW},
         {"device", required_argument, 0, 'D'},
         {"input", required_argument, 0, 'i'},
         {"rate", required_argument, 0, 'r'},
@@ -1891,11 +1980,46 @@ int main(int argc, char **argv) {
         {0,0,0,0}
     };
 
+    /* Walk real options so an option-looking argument is never a config path. */
+    opterr=0;
+    for(;;) {
+        int c=getopt_long(argc,argv,"c:D:i:r:o:avh",opts,NULL);
+        if(c==-1)break;
+        if(c=='c' && service_config(&service,optarg))return 2;
+    }
+    optind=1;opterr=1;
+#ifdef __APPLE__
+    optreset=1;
+#endif
+    const char *device = service.device;
+    const char *infile = NULL;
+    unsigned rate = service.rate;
+    int raw=0,timed_raw=0,check_config=0;
+    int verbose=service.verbose,auto_offset=service.auto_offset,manual_offset=service.manual_offset;
+    double tone_offset=service.offset;
+    int do_analyze = -1, do_search = -1, stream_too = 0, track_too = 0, recover = 0;
+    int ncand = 5;
+    double at_time = -1.0;
+    double harm_reject=service.harm_reject;
+    double min_snr=service.min_snr;
+
+
     for (;;) {
         int idx = 0;
-        int c = getopt_long(argc, argv, "D:i:r:o:avh", opts, &idx);
+        int c = getopt_long(argc, argv, "c:D:i:r:o:avh", opts, &idx);
         if (c == -1) break;
         switch (c) {
+            case 'c': break;
+            case OPT_CHECK_CONFIG: check_config=1;break;
+            case OPT_DAEMON: service.daemonize=1;break;
+            case OPT_FOREGROUND: service.daemonize=0;break;
+            case OPT_TIMED_RAW: timed_raw=1;break;
+            case OPT_PIDFILE: case OPT_LOGFILE: case OPT_SHM: case OPT_SOCK: case OPT_CORRECTION: case OPT_PRECISION: {
+                const char *key=c==OPT_PIDFILE?"pidfile":c==OPT_LOGFILE?"logfile":c==OPT_SHM?"shm-unit":
+                    c==OPT_SOCK?"sock":c==OPT_CORRECTION?"correction":"precision";
+                if(service_setting(&service,key,optarg)){fprintf(stderr,"invalid %s: %s\n",key,optarg);return 2;}
+                break;
+            }
             case 'D': device = optarg; break;
             case 'i': infile = optarg; break;
             case 'r': {
@@ -1911,7 +2035,7 @@ int main(int argc, char **argv) {
             case 'o': {
                 char *end = NULL;
                 double v = strtod(optarg, &end);
-                if (!end || *end || !isfinite(v) || v < -3000.0 || v > 3000.0) {
+                if (!end || end==optarg || *end || !isfinite(v) || v < -3000.0 || v > 3000.0) {
                     fprintf(stderr, "invalid tone offset: %s\n", optarg);
                     return 2;
                 }
@@ -1928,18 +2052,37 @@ int main(int argc, char **argv) {
             case OPT_STREAM: stream_too = 1; break;
             case OPT_TRACK: track_too = 1; break;
             case OPT_RECOVER: recover = 1; break;
-            case OPT_AT: at_time = strtod(optarg, NULL); break;
+            case OPT_AT: {
+                char *end;at_time=strtod(optarg,&end);
+                if(end==optarg||*end||!isfinite(at_time)||at_time<0){fprintf(stderr,"invalid --at\n");return 2;}
+                break;
+            }
             case OPT_CAND: ncand = atoi(optarg); if (ncand < 1) ncand = 1; break;
-            case OPT_HARM: harm_reject = strtod(optarg, NULL); break;
-            case OPT_SNR: min_snr = strtod(optarg, NULL); break;
+            case OPT_HARM: case OPT_SNR:
+                if(service_setting(&service,c==OPT_HARM?"harm-reject":"min-snr",optarg)) {
+                    fprintf(stderr,"invalid tuning value: %s\n",optarg);return 2;
+                }
+                harm_reject=service.harm_reject;min_snr=service.min_snr;break;
             case 'v': verbose++; break;
             case 'h': usage(stdout, argv[0]); return 0;
             default: usage(stderr, argv[0]); return 2;
         }
     }
 
-    if (!infile && optind < argc) infile = argv[optind];
+    if(!infile && optind<argc)infile=argv[optind++];
+    if(optind<argc){fprintf(stderr,"unexpected positional arguments\n");return 2;}
 
+    int exporting=service.output.shm_unit>=0 || service.output.sock[0];
+    if(!isfinite(harm_reject)||harm_reject<=0||!isfinite(min_snr)||min_snr<0||!isfinite(at_time)) {
+        fprintf(stderr,"invalid numeric options\n");return 2;
+    }
+    if((exporting&&(infile||raw||recover||track_too||stream_too)) ||
+       (timed_raw&&(infile||raw||auto_offset)) ||
+       (service.daemonize&&(infile||raw||timed_raw||!service.pidfile[0]||!service.logfile[0]))) {
+        fprintf(stderr,"refclock requires live ALSA or --timed-raw; daemon requires live ALSA, absolute pidfile and logfile\n");return 2;
+    }
+    if(check_config) {printf("configuration OK: rate=%u daemon=%d shm-unit=%d sock=%s\n",rate,service.daemonize,service.output.shm_unit,service.output.sock);return 0;}
+    signal(SIGPIPE,SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -1960,27 +2103,31 @@ int main(int argc, char **argv) {
         auto_offset = 0;
     }
 
+    int started=service_start(&service);
+    if(started>0)return 0;
+    if(started<0){service_stop();return 1;}
+    refclock output;
+    if(refclock_open(&output,&service.output,rate)){service_ready(1);service_stop();return 1;}
     decoder_t d;
     decoder_init(&d, rate, verbose, tone_offset, harm_reject, min_snr);
+    d.output=exporting?&output:NULL;
     if (verbose && !auto_offset)
         fprintf(stderr, "detectors: offset=%+.2f Hz data=%.2f tick=%.2f hour=%.2f Hz\n",
                 tone_offset, 100.0 + tone_offset, 1000.0 + tone_offset,
                 1500.0 + tone_offset);
 
     int rc;
-    if (raw) {
-        rc = run_raw(&d, auto_offset, harm_reject, min_snr);
-        timing_corr_free(&d.timing);
-        return rc;
-    }
+    if(timed_raw) rc=run_timed_raw(&d);
+    else if(raw) {service_ready(0);rc=run_raw(&d,auto_offset,harm_reject,min_snr);}
+    else {
 #ifdef WWV_NO_ALSA
-    (void)device;
-    fprintf(stderr, "No ALSA support in this build; use -i FILE or --raw.\n");
-    timing_corr_free(&d.timing);
-    return 2;
+        (void)device;
+        fprintf(stderr,"No ALSA support in this build; use -i FILE, --raw or --timed-raw.\n");rc=2;
 #else
-    rc = run_alsa(&d, device, auto_offset, harm_reject, min_snr);
-    timing_corr_free(&d.timing);
-    return rc;
+        rc=run_alsa(&d,device,auto_offset,harm_reject,min_snr);
 #endif
+    }
+    fprintf(stderr,"refclock: %llu samples published\n",(unsigned long long)output.sent);
+    refclock_close(&output);timing_corr_free(&d.timing);
+    service_stop();return rc;
 }

@@ -38,5 +38,6 @@ int main(void) {
  recovery_candidate_t pair[2]={{0}};pair[0].t=51;pair[0].minute=100;
  pair[1].t=111;pair[1].minute=101;recovery_confirm(pair,2);
  assert(pair[0].confirmed && pair[1].confirmed);
+ assert(estimate_tone_offset(NULL,0,8000,0)==0);
  puts("core validation passed"); return 0;
 }
